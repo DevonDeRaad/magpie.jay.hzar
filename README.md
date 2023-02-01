@@ -1,6 +1,6 @@
 # magpie.jay.hzar
 
-### This repository holds the data and code needed to reproduce the geographic cline analyses performed in Pizarro et al. 2023, "Temporal stability of the hybrid zone between Calocitta magpie-jays revealed through comparison of museum specimens and iNaturalist photos".
+This repository holds the data and code needed to reproduce the geographic cline analyses performed in Pizarro et al. 2023, "Temporal stability of the hybrid zone between Calocitta magpie-jays revealed through comparison of museum specimens and iNaturalist photos".
 
 ### Raw data
 -------
