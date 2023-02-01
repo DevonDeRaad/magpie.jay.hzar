@@ -1,0 +1,353 @@
+---
+title: "Magpie Jay Clines - run on KUHPCC"
+author: "Devon DeRaad"
+date: '2022-10-10'
+output: html_document
+---
+
+```{r}
+## Load the package
+library(hzar)
+
+#manually generated set of distances
+#c(0,197,447,631,666,1029,1124,1550,1957,1994)
+
+##Load the data for each sample in our historical transect
+hyb_Index <- read.csv("Magpie.Jay.data.updated.csv")
+#assign population as a factor in a separate column
+hyb_Index$sample.loc<-as.factor(hyb_Index$Population)
+##sort by distance
+#hyb_Index<-hyb_Index[order(hyb_Index$Population),]
+
+#split the dataframe into separate modern and ancestral dataframes based on the 'Period' column
+#modern
+hyb_Index.modern <- hyb_Index[hyb_Index$Period == 1,]
+#ancestral
+hyb_Index.anc <- hyb_Index[hyb_Index$Period == 0,]
+
+#make a separate dataframe with geographic distance, and the mean of each input value for each sampling locality
+#modern samples only
+locs.modern<-data.frame(site.id=unique(hyb_Index.modern$Population),
+                 dist=c(0,197,447,631,666,1029,1124,1550,1957,1994),
+                 throat=aggregate(hyb_Index.modern$Throat~hyb_Index.modern$Population, FUN=mean)[,2])
+
+#normalize the throat score to a 0-1 range (required by input function)
+locs.modern$throat<-locs.modern$throat/5
+
+#make a separate dataframe with geographic distance, and the mean of each input value for each sampling locality
+#ancestral samples only
+locs.ancestral<-data.frame(site.id=unique(hyb_Index.anc$Population),
+                 dist=c(0,197,447,631,666,1029,1124,1550,1957,1994),
+                 throat=aggregate(hyb_Index.anc$Throat~hyb_Index.anc$Population, FUN=mean)[,2])
+
+#normalize the throat score to a 0-1 range (required by input function)
+locs.ancestral$throat<-locs.ancestral$throat/5
+
+# set Chain length
+chainLength=1e6                    
+```
+
+### this chunk defines 3 helper functions that will (1) run 3 separate hzar models, (2) check for convergence, and (3) process the cline output to make it easily plot-able
+```{r}
+### function 1:
+#write function to run 3 different hzar models and store the output in a single list
+run3hzarmodels<-function(input.trait=NULL, begin=NULL,end=NULL){
+  ## create empty object to hold results
+  x <- list() #designate the firs trait 'Comp.1'
+  x$models <- list() #Space to hold the models to fit
+  x$fitRs <- list() #Space to hold the compiled fit requests
+  x$runs <- list() #Space to hold the output data chains
+  x$analysis <- list() #Space to hold the analysed data
+  
+  #add input observed data to list
+  x$obs<-input.trait
+  
+  #load the three different models we will test
+  #min and max values fixed to observed data, no exponential tails
+  x$models[["modelI"]]<-hzar.makeCline1DFreq(x$obs, "fixed", "none")
+  #min and max values estimated as free parameters, no exponential tails
+  x$models[["modelII"]]<-hzar.makeCline1DFreq(x$obs, "free", "none")
+  #min and max values estimated as free paramaters, tails estimated as independent paramaters
+  x$models[["modelIII"]]<-hzar.makeCline1DFreq(x$obs, "free", "both")
+
+  #modify all models to focus on observed region 
+  x$models <- sapply(x$models, hzar.model.addBoxReq, begin, end, simplify=FALSE)
+  
+  ## Compile each of the models to prepare for fitting
+  #fit each of the 3 models we set up to the observed data
+  x$fitRs$init <- sapply(x$models, hzar.first.fitRequest.old.ML, obsData=x$obs, verbose=FALSE, simplify=FALSE)
+  
+  #update settings for the fitter using chainLength created before
+  x$fitRs$init$modelI$mcmcParam$chainLength <- chainLength
+  x$fitRs$init$modelI$mcmcParam$burnin <- chainLength %/% 10
+  x$fitRs$init$modelII$mcmcParam$chainLength <- chainLength
+  x$fitRs$init$modelII$mcmcParam$burnin <- chainLength %/% 10
+  x$fitRs$init$modelIII$mcmcParam$chainLength <- chainLength
+  x$fitRs$init$modelIII$mcmcParam$burnin <- chainLength %/% 10
+
+  ## Run just one of the models for an initial chain
+  x$runs$init$modelI <-hzar.doFit(x$fitRs$init$modelI)
+  ## Run another model for an initial chain
+  x$runs$init$modelII <- hzar.doFit(x$fitRs$init$modelII)
+  ## Run another model for an initial chain
+  x$runs$init$modelIII <- hzar.doFit(x$fitRs$init$modelIII)
+
+  ## Compile a new set of fit requests using the initial chains 
+  x$fitRs$chains <-lapply(x$runs$init,hzar.next.fitRequest)
+  
+  ## Replicate each fit request 3 times
+  x$fitRs$chains <-hzar.multiFitRequest(x$fitRs$chains,each=3)
+
+  ##Run a chain of 3 runs for every fit request
+  x$runs$chains <-hzar.doChain.multi(x$fitRs$chains,doPar=TRUE,inOrder=FALSE,count=3)
+  
+  return(x)
+}
+
+### function 2:
+#function to check MCMC convergence
+check.convergence<-function(input.hzar=NULL){
+  ## Check for convergence
+  print("did chains from modelI converge?")
+  plot(hzar.mcmc.bindLL(input.hzar$runs$init$modelIII))  ## Plot the trace model I
+  print("did chains from modelII converge?")
+  plot(hzar.mcmc.bindLL(input.hzar$runs$init$modelIII))  ## Plot the trace model II
+  print("did chains from modelIII converge?")
+  plot(hzar.mcmc.bindLL(input.hzar$runs$init$modelIII))  ## Plot the trace model III
+}
+
+### function 3:
+#write function to do the processing necessary before plotting the resulting cline
+analyze.hzar.output<-function(input.hzar=NULL, input.var=NULL){
+  #add a null model where allele frequency is independent of sampling locality
+  input.hzar$analysis$initDGs <- list(nullModel =  hzar.dataGroup.null(input.hzar$obs))
+
+  #start aggregation of data for analysis
+  #create a model data group for each model from the initial runs
+  input.hzar$analysis$initDGs$modelI<- hzar.dataGroup.add(input.hzar$runs$init$modelI)
+  input.hzar$analysis$initDGs$modelII <-hzar.dataGroup.add(input.hzar$runs$init$modelII)
+  input.hzar$analysis$initDGs$modelIII<- hzar.dataGroup.add(input.hzar$runs$init$modelIII)
+  
+  ##create a hzar.obsDataGroup object from the four hzar.dataGroup just created, copying the naming scheme
+  input.hzar$analysis$oDG<-hzar.make.obsDataGroup(input.hzar$analysis$initDGs)
+  input.hzar$analysis$oDG <- hzar.copyModelLabels(input.hzar$analysis$initDGs,input.hzar$analysis$oDG)
+  
+  ##convert all runs to hzar.dataGroup objects
+  input.hzar$analysis$oDG <-hzar.make.obsDataGroup(input.hzar$analysis$initDGs)
+  input.hzar$analysis$oDG <-hzar.copyModelLabels(input.hzar$analysis$initDGs,input.hzar$analysis$oDG)
+  input.hzar$analysis$oDG <-hzar.make.obsDataGroup(lapply(input.hzar$runs$chains,hzar.dataGroup.add),input.hzar$analysis$oDG)
+  #this no longer works
+  #input.hzar$analysis$oDG <- hzar.make.obsDataGroup(lapply(input.hzar$runs$doSeq,   hzar.dataGroup.add),input.hzar$analysis$oDG)
+  
+  #compare the 5 cline models graphically
+  print("output clines from each model overlaid")
+  hzar.plot.cline(input.hzar$analysis$oDG)
+  
+  #model selection based on AICc scores
+  print("AICc table")
+  print(input.hzar$analysis$AICcTable<- hzar.AICc.hzar.obsDataGroup(input.hzar$analysis$oDG))
+  
+  #Extract the hzar.dataGroup object for the selected model
+  print("best model based on AICc")
+  print(input.hzar$analysis$model.name<-   rownames(input.hzar$analysis$AICcTable)[[which.min(input.hzar$analysis$AICcTable$AICc)]])
+  input.hzar$analysis$model.selected<- input.hzar$analysis$oDG$data.groups[[input.hzar$analysis$model.name]]
+  
+  #print the point estimates for cline width and center for the selected model
+  input.hzar$analysis$modeldetails <- hzar.get.ML.cline(input.hzar$analysis$model.selected)
+  input.hzar$analysis$modeldetails$param.all$width
+  input.hzar$analysis$modeldetails$param.all$center
+  
+  #Print the 2LL confidence intervals for each parameter under the best model
+  print("2LL confidence intervals for all estimated parameters")
+  print(hzar.getLLCutParam(input.hzar$analysis$model.selected,   names(input.hzar$analysis$model.selected$data.param)))
+  
+  #plot the maximum likelihood cline for the selected model
+  print("maximum likelihood cline")
+  hzar.plot.cline(input.hzar$analysis$model.selected,pch=19,xlab="Distance (km)",ylab=input.var)
+  
+  #plot the 95% credible cline region for the selected model
+  print("95% credible cline region for the optimal model")
+  hzar.plot.fzCline(input.hzar$analysis$model.selected,pch=19,xlab="Distance (km)",ylab=input.var)
+  return(input.hzar)
+}
+```
+
+### Now we will use these helper functions to make clines for historical throat color
+```{r, results='hide'}
+## Set up first input trait (throat historical)
+throat.hist.input <- hzar.doMolecularData1DPops(distance=locs.ancestral$dist,
+                                             pObs=locs.ancestral$throat,
+                                             nEff=as.vector(table(hyb_Index.anc$Population)))
+
+#run 3 models
+throat.hist<-run3hzarmodels(input.trait=throat.hist.input,
+                                 begin=0,
+                                 end=1994)
+```
+
+
+```{r, fig.height=10, fig.width=6, fig.align = "center"}
+#check convergence
+check.convergence(throat.hist)
+```
+
+```{r}
+#run analysis function on genome wide ancestry input
+hist.plot<-analyze.hzar.output(throat.hist, input.var = "historical throat color")
+```
+
+### contemporary throat color
+```{r, results='hide'}
+#Set up next input trait (modern throat color)
+throat.contemp.input <- hzar.doMolecularData1DPops(distance=locs.modern$dist,
+                                            pObs=locs.modern$throat,
+                                            nEff=as.vector(table(hyb_Index.modern$Population)))
+
+#run 3 models
+throat.contemp<-run3hzarmodels(input.trait=throat.contemp.input,
+                              begin=0,
+                              end=1994)
+```
+
+```{r, fig.height=10, fig.width=6, fig.align = "center"}
+#check convergence
+check.convergence(throat.contemp)
+```
+
+```{r}
+#run analysis function on genome wide ancestry input
+contemp.plot<-analyze.hzar.output(throat.contemp, input.var = "contemporary throat color")
+```
+
+### plot clines overlaid
+```{r}
+#plot the clines overlaid
+hzar.plot.cline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.cline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="gray")
+
+#plot the clines overlaid with 95% credible intervals
+hzar.plot.fzCline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.fzCline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="black",fzCol = "red")
+```
+
+### save clines overlaid
+```{r}
+pdf("magpiejay.overlaid.clines.pdf", width = 4.25, height = 4) #open PDF
+#plot the clines overlaid
+hzar.plot.cline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.cline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="gray")
+dev.off() #close PDF
+
+pdf("magpiejay.overlaid.fuzzy.clines.pdf", width = 4.25, height = 4) #open PDF
+#plot the clines overlaid with 95% credible intervals
+hzar.plot.fzCline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.fzCline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="gray")
+dev.off() #close PDF
+```
+
+### plot 2 log-likelihood center estimates
+```{r}
+#get 2LL estimates of center for each selected model and add them to a dataframe for plotting
+center.vals<-hzar.getLLCutParam(contemp.plot$analysis$model.selected, names(contemp.plot$analysis$model.selected$data.param))[1:2]
+center.vals$center<-contemp.plot$analysis$modeldetails$param.all$center
+center.vals$input<-c("contemporary")
+center.vals[2,]<-c(hzar.getLLCutParam(hist.plot$analysis$model.selected, names(hist.plot$analysis$model.selected$data.param))[1:2],
+                   hist.plot$analysis$modeldetails$param.all$center,
+                   "historical")
+
+#plot as box plots
+boxplot(center.vals$center ~ center.vals$input, ylim = c(0, 2000), horizontal = TRUE)
+rect(center.vals$center2LLLow[center.vals$input == "contemporary"],.8,
+     center.vals$center2LLHigh[center.vals$input == "contemporary"],1.2, col="black")
+rect(center.vals$center2LLLow[center.vals$input == "historical"],1.8,
+     center.vals$center2LLHigh[center.vals$input == "historical"],2.2, col="gray")
+
+#save box plots
+pdf("magpiejay.gen.centers.pdf", width = 4.25, height = 3) #open PDF
+boxplot(center.vals$center ~ center.vals$input, ylim = c(0, 2000), horizontal = TRUE)
+rect(center.vals$center2LLLow[center.vals$input == "contemporary"],.8,
+     center.vals$center2LLHigh[center.vals$input == "contemporary"],1.2, col="black")
+rect(center.vals$center2LLLow[center.vals$input == "historical"],1.8,
+     center.vals$center2LLHigh[center.vals$input == "historical"],2.2, col="gray")
+dev.off()
+
+#plot above the cline
+#set plotting layout
+par(mar = c(4, 4, .1, .1))
+layout.matrix <- matrix(c(1, 2), nrow = 2, ncol = 1)
+
+layout(mat = layout.matrix,
+       heights = c(2, 5), # Heights of the two rows
+       widths = c(8)) # Width of the column
+#plot1
+boxplot(center.vals$center ~ center.vals$input, ylim = c(0, 2000), horizontal = TRUE)
+rect(center.vals$center2LLLow[center.vals$input == "contemporary"],.8,
+     center.vals$center2LLHigh[center.vals$input == "contemporary"],1.2, col="black")
+rect(center.vals$center2LLLow[center.vals$input == "historical"],1.8,
+     center.vals$center2LLHigh[center.vals$input == "historical"],2.2, col="gray")
+#plot2
+#plot the clines overlaid
+hzar.plot.cline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.cline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="gray")
+
+#save plot
+pdf("magpiejay.overlaid.genetic.clines.with.centers.pdf", width = 4.25, height = 5) #open PDF
+#plot above the cline
+#set plotting layout
+par(mar = c(4, 4, .1, .1))
+layout.matrix <- matrix(c(1, 2), nrow = 2, ncol = 1)
+
+layout(mat = layout.matrix,
+       heights = c(2, 5), # Heights of the two rows
+       widths = c(8)) # Width of the column
+#plot1
+boxplot(center.vals$center ~ center.vals$input, ylim = c(0, 2000), horizontal = TRUE)
+rect(center.vals$center2LLLow[center.vals$input == "contemporary"],.8,
+     center.vals$center2LLHigh[center.vals$input == "contemporary"],1.2, col="black")
+rect(center.vals$center2LLLow[center.vals$input == "historical"],1.8,
+     center.vals$center2LLHigh[center.vals$input == "historical"],2.2, col="gray")
+#plot2
+#plot the clines overlaid
+hzar.plot.cline(contemp.plot$analysis$model.selected,pch=24,xlab="Distance (km)")
+hzar.plot.cline(hist.plot$analysis$model.selected,pch=24,xlab="Distance (km)",add=TRUE,col="gray")
+dev.off() #save
+```
+
+
+#compare cline widths
+```{r}
+#pull point estimates and 2LL widths for modern and historical
+center.vals<-hzar.getLLCutParam(contemp.plot$analysis$model.selected, names(contemp.plot$analysis$model.selected$data.param))[3:4]
+center.vals$center<-contemp.plot$analysis$modeldetails$param.all$width
+center.vals$input<-c("contemporary")
+center.vals[2,]<-c(hzar.getLLCutParam(hist.plot$analysis$model.selected, names(hist.plot$analysis$model.selected$data.param))[3:4],
+                   hist.plot$analysis$modeldetails$param.all$width,
+                   "historical")
+
+#show each width estimate and 2LL confidence band
+center.vals
+
+#make plotting df
+df<-data.frame(val=c(t(center.vals)[1:3,1],t(center.vals)[1:3,2]),
+               time=c(rep("cont", times=3),rep("hist",times=3)))
+df$val<-as.numeric(df$val)
+boxplot(val~time,data=df)
+
+#plot
+boxplot(center.vals$center ~ center.vals$input, horizontal = FALSE, ylim = c(0, 200), main="cline width comparison")
+rect(.8,center.vals$width2LLLow[center.vals$input == "contemporary"],
+     1.2,center.vals$width2LLHigh[center.vals$input == "contemporary"], col="black")
+rect(1.8, center.vals$width2LLLow[center.vals$input == "historical"],
+     2.2, center.vals$width2LLHigh[center.vals$input == "historical"], col="gray")
+#I can't remember what the significance measure is here. Do the 2LL estimates need to be non-overlapping? Or is it good enough that the point estimates are reciprocally outside the 2LL estimate from the alternate time period?
+
+#save
+pdf("magpiejay.width.estimates.pdf", width = 5, height = 5) #open PDF
+boxplot(center.vals$center ~ center.vals$input, horizontal = FALSE, ylim = c(0, 200), main="cline width comparison")
+rect(.8,center.vals$width2LLLow[center.vals$input == "contemporary"],
+     1.2,center.vals$width2LLHigh[center.vals$input == "contemporary"], col="black")
+rect(1.8, center.vals$width2LLLow[center.vals$input == "historical"],
+     2.2, center.vals$width2LLHigh[center.vals$input == "historical"], col="gray")
+dev.off()
+```
+
